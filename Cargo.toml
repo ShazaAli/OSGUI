@@ -1,0 +1,15 @@
+[package]
+name = "my_project"
+version = "0.1.0"
+edition = "2021"
+
+
+[[bin]]
+name = "my_project"
+path = "main.rs"
+
+[dependencies]
+pnet = "0.27.2"
+pcap = "0.8"
+if-addrs = "0.6.5"
+regex = "1.5.4"
