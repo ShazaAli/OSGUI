@@ -36,19 +36,9 @@ pub struct Process {
     name: String,
 }
 
-impl Process {
-    pub fn new(id: u32, name: &str) -> Self {
-        Self {
-            id,
-            name: name.to_string(),
-        }
-    }
-
-
-}
 // Define the Packet struct
 #[derive(Clone, Debug)]
-pub struct Packets {
+struct Packets {
     sent_size: u32,
     received_size: u32,
     sent_number: u32,
@@ -170,44 +160,6 @@ async fn main() {
 
     let network_task = tokio::spawn(async move{
     
-    // Define the HashMap
-    let process_packet_map: Arc<Mutex<HashMap<Process, Packets>>> = Arc::new(Mutex::new(HashMap::new()));
-    let global_process_packet_map: Arc<Mutex<HashMap<Process, Packets>>> = Arc::new(Mutex::new(HashMap::new()));
-
-    // In your main function, clone the Arc before moving it into the thread
-    let map_for_thread = Arc::clone(&process_packet_map);
-    let global_map_for_thread = Arc::clone(&global_process_packet_map);
-
-    // Spawn a new thread for printing the live outputs
-    let monitor_task = tokio::spawn(async move{
-        loop {
-            Monitor(&map_for_thread, &global_map_for_thread);
-            thread::sleep(Duration::from_secs(1));
-        }
-    });
-
-    // Choose the network interface for capturing. E.g., "eth0"
-    let interface = "enp0s3";
-
-    // Wait for both tasks to complete
-
-    
-
-    // Define the HashMap
-    let process_packet_map: Arc<Mutex<HashMap<Process, Packets>>> = Arc::new(Mutex::new(HashMap::new()));
-    let global_process_packet_map: Arc<Mutex<HashMap<Process, Packets>>> = Arc::new(Mutex::new(HashMap::new()));
-
-    // In your main function, clone the Arc before moving it into the thread
-    let map_for_thread = Arc::clone(&process_packet_map);
-    let global_map_for_thread = Arc::clone(&global_process_packet_map);
-    // Spawn a new thread for printing the live outputs
-    
-    thread::spawn(move || {
-        loop {
-            Monitor(&map_for_thread, &global_map_for_thread);
-            thread::sleep(Duration::from_secs(1));
-        }
-    });
 
     
     // Choose the network interface for capturing. E.g., "eth0"
@@ -218,6 +170,33 @@ async fn main() {
         .expect("No such interface or interface does not have an IP address");
 
     let ip = interface_addr.addr.ip();
+
+    // Define the HashMap
+    let process_packet_map: Arc<Mutex<HashMap<Process, Packets>>> = Arc::new(Mutex::new(HashMap::new()));
+    let global_process_packet_map: Arc<Mutex<HashMap<Process, Packets>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let ss_output_map: Arc<Mutex<HashMap<String, Process>>> = Arc::new(Mutex::new(HashMap::new()));
+    let ss_map_for_thread = Arc::clone(&ss_output_map);
+    thread::spawn(move || {
+        loop {
+            // Run the ss command
+            SSUpdate(&ss_map_for_thread, ip);
+
+            // Sleep for a while before the next update
+            //thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    // In your main function, clone the Arc before moving it into the thread
+    let map_for_thread = Arc::clone(&process_packet_map);
+    let global_map_for_thread = Arc::clone(&global_process_packet_map);
+    // Spawn a new thread for printing the live outputs
+    thread::spawn(move || {
+        loop {
+            Monitor(&map_for_thread, &global_map_for_thread);
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
 
     // Open the capture for the given interface
     let mut cap = pcap::Capture::from_device(interface).unwrap()
@@ -233,38 +212,28 @@ async fn main() {
         let IPC = ip.clone();
         let map_for_thread = Arc::clone(&process_packet_map);
         let map_for_thread_clone = Arc::clone(&map_for_thread);
+        let ss_map_for_thread = Arc::clone(&ss_output_map);
         thread::spawn(move || {
-                Capture(&map_for_thread, ethernet, IPC, len);
+                Capture(&map_for_thread, ethernet, IPC, len,&ss_map_for_thread);
         });
     
         let new_data = map_for_thread_clone.lock().unwrap().clone();
     sender.send(Message::NewData(new_data)).unwrap();
-    use std::collections::HashMap;
 
-    // Create a new HashMap
-    let mut test_data: HashMap<Process, Packets> = HashMap::new();
-    
-    // Create instances of Process and Packets
-let process = Process::new(10,"process1");
-let packets = Packets::new(100, 200, 300, 400);
-
-// Insert the process and packets into the HashMap
-test_data.insert(process, packets);
-    
-    // Send test_data
-//    sender.send(Message::NewData(test_data)).unwrap();
     }
     });
     App::run(Settings::with_flags(UiFlags { receiver }));
     let _ = tokio::try_join!(network_task);
 
-}
+      
+    }
+
 
 
 fn Monitor(process_packet_map: &Arc<Mutex<HashMap<Process, Packets>>>, global_process_packet_map: &Arc<Mutex<HashMap<Process, Packets>>>) {
     // Lock the Mutex before accessing the HashMap
     {
-    let mut map = process_packet_map.lock().unwrap();
+    let map = process_packet_map.lock().unwrap();
     let mut global_map = global_process_packet_map.lock().unwrap();
 
     // Print the process packet map
@@ -304,148 +273,123 @@ fn Monitor(process_packet_map: &Arc<Mutex<HashMap<Process, Packets>>>, global_pr
     }
 }
 
-fn Capture(process_packet_map: &Arc<Mutex<HashMap<Process, Packets>>>, ethernet: EthernetPacket, ip: IpAddr, packet_length: u32){
-    let ss_out = Command::new("ss")
-            .arg("-p")
-            .arg("-n")
-            .arg("-t")
-            .arg("-u")
-            .output()
-            .expect("Failed to execute command");
-        let ss_output = str::from_utf8(&ss_out.stdout).unwrap();
-        let lines = ss_output.lines();
-        //use pnet to analyze the captured packet and obtain its source port and address
-        if let Some(ipv4) = Ipv4Packet::new(ethernet.payload()) {
-            let address = ipv4.get_source();
-            let port;
-            match ipv4.get_next_level_protocol() {
-                pnet::packet::ip::IpNextHeaderProtocols::Tcp => {
-                    if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
+fn Capture(process_packet_map: &Arc<Mutex<HashMap<Process, Packets>>>, ethernet: EthernetPacket, ip: IpAddr, packet_length: u32, ports: &Arc<Mutex<HashMap<String, Process>>>){
+    //use pnet to analyze the captured packet and obtain its source port and address
+    if let Some(ipv4) = Ipv4Packet::new(ethernet.payload()) {
+        let address = ipv4.get_source();
+        let port;
+        match ipv4.get_next_level_protocol() {
+            pnet::packet::ip::IpNextHeaderProtocols::Tcp => {
+                if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
+                    if address == ip {
                         port = tcp.get_source();
-                        let search_string = format!("{}:{}", address, port);
-                        for line in lines {
-                            // Check if the line contains the search string
-                            if line.contains(&search_string) {
-                                // Create a regular expression to match the PID pattern
-                                let re = Regex::new(r"pid=(\d+)").unwrap();
-
-                                // Search for the PID in the line
-                                if let Some(captures) = re.captures(&line) {
-                                    if let Some(pid) = captures.get(1) {
-                                        let pid_num = pid.as_str().parse::<u32>().unwrap(); // Convert the pid string to a number
-
-                                        // Get the process name
-                                        let output = Command::new("ps")
-                                            .arg("-p")
-                                            .arg(pid.as_str())
-                                            .arg("-o")
-                                            .arg("comm=")
-                                            .output()
-                                            .expect("Failed to execute command");
-                                        let process_name = String::from_utf8(output.stdout).unwrap().trim().to_string();
-
-                                        let mut map = process_packet_map.lock().unwrap();
-                                        let pack = map.entry(Process { id: pid_num, name: process_name })
-                                            .or_insert(Packets { sent_size: 0, received_size: 0, sent_number: 0, received_number: 0 });
-                                        if address == ip {
-                                            pack.sent_size += (packet_length * 8) as u32;
-                                            pack.sent_number += 1;
-                                        } else {
-                                            pack.received_size += (packet_length * 8) as u32;
-                                            pack.received_number += 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                    /*   port = tcp.get_destination();
-                        address = ipv4.get_destination();
-                        let outgoing = Command::new("ss")
-                            .arg("-p")
-                            .arg("-n")
-                            .arg("-t")
-                            .arg("dst")
-                            .arg(format!("{}:{}", address, port))
-                            .output()
-                            .expect("Failed to execute command");
-
-                        let income = str::from_utf8(&incoming.stdout).unwrap();
-                        let outcome = str::from_utf8(&outgoing.stdout).unwrap();
-                        println!("Input: {}", income);
-                        println!("Output: {}", outcome);
-                        println!("{}:{}", address, port);*/
+                    } else {
+                        port = tcp.get_destination();
                     }
-                },
-                pnet::packet::ip::IpNextHeaderProtocols::Udp => {
-                    if let Some(udp) = UdpPacket::new(ipv4.payload()) {
-                        port = udp.get_source();
-                        let search_string = format!("{}:{}", address, port);
-                        for line in lines {
-                            // Check if the line contains the search string
-                            if line.contains(&search_string) {
-                                // Create a regular expression to match the PID pattern
-                                let re = Regex::new(r"pid=(\d+)").unwrap();
-                                // Search for the PID in the line
-                                if let Some(captures) = re.captures(&line) {
-                                    if let Some(pid) = captures.get(1) {
-                                        let pid_num = pid.as_str().parse::<u32>().unwrap(); // Convert the pid string to a number
 
-                                        // Get the process name
-                                        let output = Command::new("ps")
-                                            .arg("-p")
-                                            .arg(pid.as_str())
-                                            .arg("-o")
-                                            .arg("comm=")
-                                            .output()
-                                            .expect("Failed to execute command");
-                                        let process_name = String::from_utf8(output.stdout).unwrap().trim().to_string();
-
-                                        let mut map = process_packet_map.lock().unwrap();
-                                        let pack = map.entry(Process { id: pid_num, name: process_name })
-                                            .or_insert(Packets { sent_size: 0, received_size: 0, sent_number: 0, received_number: 0 });
-                                        if address == ip {
-                                            pack.sent_size += (packet_length * 8) as u32;
-                                            pack.sent_number += 1;
-                                        } else {
-                                            pack.received_size += (packet_length * 8) as u32;
-                                            pack.received_number += 1;
-                                        }
-                                    }
-                                }
+                    // Get the process name and info from the ports map
+                    let ports_map = ports.lock().unwrap();
+                    match ports_map.get(&port.to_string()) {
+                        Some(process) => {
+                            let mut map = process_packet_map.lock().unwrap();
+                            let pack = map.entry(process.clone())
+                                .or_insert(Packets { sent_size: 0, received_size: 0, sent_number: 0, received_number: 0 });
+                            if address == ip {
+                                pack.sent_size += (packet_length * 8) as u32;
+                                pack.sent_number += 1;
+                            } else {
+                                pack.received_size += (packet_length * 8) as u32;
+                                pack.received_number += 1;
                             }
-                        }
-                        /*let incoming = Command::new("ss")
-                            .arg("-p")
-                            .arg("-n")
-                            .arg("-u")
-                            .arg("src")
-                            .arg(format!("{}:{}", address, port))
-                            .output()
-                            .expect("Failed to execute command");
-
-                        port = udp.get_destination();
-                        address = ipv4.get_destination();
-                        let outgoing = Command::new("ss")
-                            .arg("-p")
-                            .arg("-n")
-                            .arg("-u")
-                            .arg("dst")
-                            .arg(format!("{}:{}", address, port))
-                            .output()
-                            .expect("Failed to execute command");
-
-                        let income = str::from_utf8(&incoming.stdout).unwrap();
-                        let outcome = str::from_utf8(&outgoing.stdout).unwrap();
-                        println!("Input: {}", income);
-                        println!("Output: {}", outcome);
-                        println!("{}:{}", address, port);*/
+                        },
+                        None => println!("Error: No process found for port {}", port),
                     }
-                },
-                _ => {
-                    println!("Lost a packet!");
                 }
+            },
+            pnet::packet::ip::IpNextHeaderProtocols::Udp => {
+                if let Some(udp) = UdpPacket::new(ipv4.payload()) {
+                    if address == ip{
+                        port = udp.get_source();
+                    } else {
+                        port = udp.get_destination();
+                    }
+
+                    // Get the process name and info from the ports map
+                    let ports_map = ports.lock().unwrap();
+                    match ports_map.get(&port.to_string()) {
+                        Some(process) => {
+                            let mut map = process_packet_map.lock().unwrap();
+                            let pack = map.entry(process.clone())
+                                .or_insert(Packets { sent_size: 0, received_size: 0, sent_number: 0, received_number: 0 });
+                            if address == ip {
+                                pack.sent_size += (packet_length * 8) as u32;
+                                pack.sent_number += 1;
+                            } else {
+                                pack.received_size += (packet_length * 8) as u32;
+                                pack.received_number += 1;
+                            }
+                        },
+                        None => println!("Error: No process found for port {}", port),
+                    }
+                }
+            },
+            _ => {
+                println!("A non-TCP/UDP packet was captured");
             }
         }
+    }
 }
 
+
+fn SSUpdate(ss_map_for_thread: &Arc<Mutex<HashMap<String, Process>>>, ip: IpAddr){
+    let ss_out = Command::new("ss")
+        .arg("-p")
+        .arg("-n")
+        .arg("-t")
+        .arg("-u")
+        .arg("-l")
+        .output()
+        .expect("Failed to execute command");
+    let ss_output = str::from_utf8(&ss_out.stdout).unwrap();
+    //print!("{}", ss_output);
+
+    // Call ps command and create a map from pid to process name
+    let ps_out = Command::new("ps")
+        .arg("-e")
+        .arg("-o")
+        .arg("pid,comm")
+        .output()
+        .expect("Failed to execute command");
+    let ps_output = str::from_utf8(&ps_out.stdout).unwrap();
+    let mut pid_to_name = HashMap::new();
+    for line in ps_output.lines().skip(1) { // Skip the header line
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            pid_to_name.insert(parts[0].to_string(), parts[1].to_string());
+        }
+    }
+
+    // Parse the output and update the shared map
+    let mut map = ss_map_for_thread.lock().unwrap();
+    for line in ss_output.lines() {
+        // Create the regular expressions
+        let re_port = Regex::new(&format!(r"({}|0.0.0.0):(\d+)", ip)).unwrap();
+        let re_pid = Regex::new(r"pid=(\d+)").unwrap();
+
+        // Use the regular expressions to extract the port number and the PID
+        let port = re_port.captures(line).and_then(|cap| cap.get(2)).map(|m| m.as_str().to_string()).unwrap_or(String::new());
+        let pid = re_pid.captures(line).and_then(|cap| cap.get(1)).map(|m| m.as_str());
+
+        // Get the process name from the pid_to_name map
+        if let Some(pid) = pid {
+            let process_name = pid_to_name.get(pid);
+
+            // Insert the pid and process name into the map
+            if let Some(process_name) = process_name {
+                let pid_u32 = pid.parse::<u32>().unwrap_or(0);
+                map.insert(port, Process{id : pid_u32, name : process_name.to_string()});
+            }
+        }
+    }
+
+}
