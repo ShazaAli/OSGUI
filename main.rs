@@ -27,7 +27,9 @@ use iced::Command as IcedCommand;
 use iced::Element;
 use iced::widget::Row;
 use iced::widget::Column;
-
+use iced::Length;
+use iced::widget::Space;
+use iced::widget::Container;
 
 // Define the Process struct
 #[derive(Clone, Hash, Eq, PartialEq)]
@@ -122,22 +124,31 @@ impl Application for App {
         }
         IcedCommand::none()
     }
-
     fn view(& self) -> Element<Self::Message> {
         let mut table = Column::new();
         let row = Row::new()
-        .push(Text::new("process".to_string()))
-        .push(Text::new("data".to_string()));
+            .push(Text::new(format!("{: >20}","process").to_string()))
+            .push(Text::new(" | ")) // Vertical line
+            .push(Text::new("data".to_string()));
         table = table.push(row);
         for (process, packets) in &self.data {
             let row = Row::new()
-                .push(Text::new(process.name.clone())) // Assuming `name` is a String
-                .push(Text::new(packets.to_string())); // Assuming `to_string` is implemented for `Packets`
+                .push(Text::new(format!("{: >20}",process.name.clone()).to_string())) // Assuming `name` is a String
+                .push(Text::new(" | ")) // Vertical line
+                .push(Text::new(format!("{: >10}",packets.sent_size).to_string()))// Assuming `to_string` is implemented for `Packets`
+            .push(Text::new(" | ")) // Vertical line
+            .push(Text::new(format!("{: >10}",packets.received_size).to_string())) // Assuming `to_string` is implemented for `Packets`
+        .push(Text::new(" | ")) // Vertical line
+        .push(Text::new(format!("{: >10}",packets.sent_number).to_string())) // Assuming `to_string` is implemented for `Packets`
+    .push(Text::new(" | ")) // Vertical line
+    .push(Text::new(format!("{: >10}",packets.received_number).to_string())); // Assuming `to_string` is implemented for `Packets`
+
             table = table.push(iced::widget::Rule::horizontal(10)); // Add a horizontal line
             table = table.push(row);
         }
         table.into()
     }
+
     fn subscription(&self) -> Subscription<Message> {
         subscription::unfold(
             "led changes",

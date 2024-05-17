@@ -9,8 +9,10 @@ name = "my_project"
 path = "main.rs"
 
 [dependencies]
+plotters-iced = "0.10"
+plotters="0.3"
 tokio = { version = "1", features = ["full"] }
-iced = "0.10.0"
+iced = { version = "0.10.0", features = ["canvas", "tokio"] }
 pnet = "0.34.0"
 pcap = "0.8"
 if-addrs = "0.6.5"
