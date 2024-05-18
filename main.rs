@@ -2,34 +2,50 @@
 // Import necessary dependencies
 extern crate pcap;
 extern crate pnet;
+// std imports
 use std::cell::RefCell;
-use iced::subscription;
-use iced::Subscription;
-use iced::futures::channel::mpsc::Sender;
-use pnet::packet::Packet;
-use pnet::packet::ethernet::EthernetPacket;
-use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::tcp::TcpPacket;
-use pnet::packet::udp::UdpPacket;
 use std::collections::HashMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::process::Command;
 use std::str;
-use if_addrs::get_if_addrs;
-use regex::Regex;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use std::net::IpAddr;
-use iced::{Application, Settings};
-use iced::widget::text::Text;
-use iced::Command as IcedCommand;
-use iced::Element;
-use iced::widget::Row;
-use iced::widget::Column;
-use iced::Length;
-use iced::widget::Space;
-use iced::widget::Container;
+
+use iced::widget::container;
+// External crate imports
+use if_addrs::get_if_addrs;
+use iced::{
+    Application, 
+    Settings, 
+    Subscription,
+    Alignment, 
+    Command as IcedCommand, 
+    Element, 
+    Length, 
+    futures::channel::mpsc::Sender, 
+    subscription, 
+    widget::{
+        button,
+        Button, 
+        text::Text, 
+        Row, 
+        Column, 
+        Space, 
+        Container
+    }
+};
+use iced_native::Align;
+use plotters::series;
+use pnet::packet::{
+    Packet, 
+    ethernet::EthernetPacket, 
+    ipv4::Ipv4Packet, 
+    tcp::TcpPacket, 
+    udp::UdpPacket
+};
+use regex::Regex;
 
 // Define the Process struct
 #[derive(Clone, Hash, Eq, PartialEq)]
@@ -68,14 +84,28 @@ impl Packets {
         }
     }
 }
-
+enum Page {
+    TablePage,
+    GraphPage,
+    ConfigPage,
+}
 // Usage
 struct App {
+    page: Page,
     data: HashMap<Process, Packets>,
     receiver: RefCell<Option<std::sync::mpsc::Receiver<Message>>>,
+    config_button: button::State,
+    graph_button: button::State,
+    table_button1: button::State,
+    table_button2: button::State,
 }
+
+#[derive(Clone)]
 enum Message {
     NewData(HashMap<Process, Packets>),
+    NavigateToTablePage,
+    NavigateToGraphPage,
+    NavigateToConfigPage,
     // other messages...
 }
 
@@ -88,10 +118,14 @@ impl fmt::Debug for Message {
                  .field("data", &"Non-debuggable data")
                  .finish()
             },
-            // handle other messages...
+            Message::NavigateToTablePage => Ok(()),
+            Message::NavigateToGraphPage => Ok(()),
+            Message::NavigateToConfigPage => Ok(()),
         }
     }
 }
+
+
 
 impl Application for App {
     type Executor = iced::executor::Default;
@@ -107,7 +141,15 @@ impl Application for App {
     // }
 
     fn new(flags: UiFlags) -> (App, IcedCommand<Self::Message>) {
-        (App { data: HashMap::new() , receiver:RefCell::new(Some(flags.receiver))}, IcedCommand::none())
+        (App {
+            page: Page::TablePage, 
+            data: HashMap::new(),
+            receiver:RefCell::new(Some(flags.receiver)),
+            config_button: button::State::new(),
+            graph_button: button::State::new(),
+            table_button1: button::State::new(),
+            table_button2: button::State::new(),
+        }, IcedCommand::none())
     }
 
     fn title(&self) -> String {
@@ -117,33 +159,93 @@ impl Application for App {
     fn update(&mut self, message: Self::Message) -> IcedCommand<Self::Message> {
         match message {
             Message::NewData(new_data) => {
-                for (process, packets) in new_data {
+                self.data = new_data;
+                /*for (process, packets) in new_data {
                     self.data.entry(process).or_insert(packets);
-                }            }
+                }*/            }
+            Message::NavigateToTablePage => {
+                self.page = Page::TablePage;
+            }
+            Message::NavigateToConfigPage => {
+                self.page = Page::ConfigPage;
+            }
+            Message::NavigateToGraphPage => {
+                self.page = Page::GraphPage;
+            }
             // handle other messages...
         }
         IcedCommand::none()
     }
     fn view(& self) -> Element<Self::Message> {
-        let mut table = Column::new();
-        let row = Row::new()
-            .push(Container::new(Text::new(format!("{: >20}","process"))).padding(20)) // Add padding
-            .push(Container::new(Text::new(format!("{: >10}","sent size"))).padding(20)) // Add padding
-            .push(Container::new(Text::new(format!("{: >10}","received size"))).padding(20)) // Add padding
-            .push(Container::new(Text::new(format!("{: >10}","sent number"))).padding(20)) // Add padding
-            .push(Container::new(Text::new(format!("{: >10}","received number"))).padding(20)); // Add padding
-        table = table.push(row);
-        for (process, packets) in &self.data {
-            let row = Row::new()
-                .push(Container::new(Text::new(format!("{: >20}",process.name.clone()))).padding(20)) // Add padding
-                .push(Container::new(Text::new(format!("{: >15}",packets.sent_size))).padding(20)) // Add padding
-                .push(Container::new(Text::new(format!("{: >15}",packets.received_size))).padding(20)) // Add padding
-                .push(Container::new(Text::new(format!("{: >15}",packets.sent_number))).padding(20)) // Add padding
-                .push(Container::new(Text::new(format!("{: >15}",packets.received_number))).padding(20)); // Add padding
-            table = table.push(iced::widget::Rule::horizontal(10)); // Add a horizontal line
-            table = table.push(row);
+        match self.page{
+            Page::TablePage => {
+                let mut table = Column::new();
+                let row = Row::new()
+                    .push(Container::new(Text::new(format!("{: >20}","process"))).padding(20)) // Add padding
+                    .push(Container::new(Text::new(format!("{: >20}","sent size"))).padding(20)) // Add padding
+                    .push(Container::new(Text::new(format!("{: >20}","received size"))).padding(20)) // Add padding
+                    .push(Container::new(Text::new(format!("{: >20}","sent number"))).padding(20)) // Add padding
+                    .push(Container::new(Text::new(format!("{: >20}","received number"))).padding(20)); // Add padding
+                table = table.push(row);
+                for (process, packets) in &self.data {
+                    let row = Row::new()
+                        .push(Container::new(Text::new(format!("{}",process.name.clone()))).padding(20)) // Add padding
+                        .push(Container::new(Text::new(format!("{: >20}",packets.sent_size))).padding(20)) // Add padding
+                        .push(Container::new(Text::new(format!("{: >20}",packets.received_size))).padding(20)) // Add padding
+                        .push(Container::new(Text::new(format!("{: >20}",packets.sent_number))).padding(20)) // Add padding
+                        .push(Container::new(Text::new(format!("{: >20}",packets.received_number))).padding(20)); // Add padding
+                    table = table.push(iced::widget::Rule::horizontal(10)); // Add a horizontal line
+                    table = table.push(row);
+                }
+
+                /// Create a row for the buttons
+                let buttons = Row::new()
+                    .push(Button::new("Graph").on_press(Message::NavigateToGraphPage))
+                    .push(Button::new("Configurations").on_press(Message::NavigateToConfigPage))
+                    .align_items(Alignment::Center);
+
+                // Add the row to the column and align it to the bottom
+                table = table.push(Space::with_height(Length::Fill)); // This will push the buttons to the bottom
+                table = table.push(buttons).align_items(Alignment::Center);
+                //table = table.align_items(Alignment::End);
+
+                table.into()
+            }
+            Page::GraphPage => {
+                let mut graph_page = Column::new();
+                //let series = Series::new(self.data,plotters_iced::series::LineSeries::new());
+                graph_page = graph_page.push(Button::new("Back").on_press(Message::NavigateToTablePage));
+                // let chart = ChartBuilder::default()
+                //     .margin(5)
+                //     .caption("Example Chart", ("Arial", 50).into_font())
+                //     .x_label_area_size(30)
+                //     .y_label_area_size(30)
+                //     .build_cartesian_2d(0f32..10f32, 0f32..10f32)
+                //     .unwrap()
+                //     .configure_mesh()
+                //     .draw()
+                //     .unwrap()
+                //     .draw_series(series)
+                //     .unwrap();
+                // Add the chart to your page
+                //graph_page = graph_page.push(chart);
+                // let button = Button::new(&mut self.table_button1)
+                //     .on_press(Message::NavigateToTablePage);
+                // graph_page = graph_page.push(button);
+            
+                graph_page.into()
+            }
+            Page::ConfigPage => {
+                let mut config_page = Column::new().push(Text::new("Config page"));
+                config_page = config_page.push(Button::new("Back").on_press(Message::NavigateToTablePage));
+                // let button = Button::new(&mut self.table_button1)
+                //     .on_press(Message::NavigateToTablePage);
+                // config_page = config_page.push(button);
+            
+                config_page.into()
+            }
         }
-        table.into()
+        
     }
     fn subscription(&self) -> Subscription<Message> {
         subscription::unfold(
@@ -201,6 +303,8 @@ async fn main() {
     thread::spawn(move || {
         loop {
             Monitor(&map_for_thread, &global_map_for_thread);
+            let new_data = global_map_for_thread.lock().unwrap().clone();
+            sender.send(Message::NewData(new_data)).unwrap();
             thread::sleep(Duration::from_secs(1));
         }
     });
@@ -223,9 +327,6 @@ async fn main() {
         thread::spawn(move || {
                 Capture(&map_for_thread, ethernet, IPC, len,&ss_map_for_thread);
         });
-    
-        let new_data = map_for_thread_clone.lock().unwrap().clone();
-    sender.send(Message::NewData(new_data)).unwrap();
 
     }
     });
