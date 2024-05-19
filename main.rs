@@ -1,43 +1,49 @@
+// plotters-iced
+//
+// Iced backend for Plotters
+// Copyright: 2022, Joylei <leingliu@gmail.com>
+// License: MIT
 
 // Import necessary dependencies
 extern crate pcap;
 extern crate pnet;
+extern crate iced;
+extern crate plotters;
+extern crate sysinfo;
+
+use chrono::{DateTime, TimeZone, Utc};
+use iced::{
+    alignment::{Horizontal, Vertical},
+    executor, font,
+    widget::{
+        canvas::{Cache, Frame, Geometry},
+        Column, Container, Row, Scrollable, Space, Text, button, Button, 
+    },
+    Alignment, Application, Command, Element, Font, Length, Settings, Size, Subscription, Theme, subscription,
+    futures::channel::mpsc::Sender, 
+
+};
+use plotters::prelude::ChartBuilder;
+use plotters_backend::DrawingBackend;
+use plotters_iced::{Chart, ChartWidget, Renderer};
 // std imports
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
-use std::process::Command;
+use std::process::Command as PrcCommand;
 use std::str;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
-
-use iced::widget::container;
-// External crate imports
-use if_addrs::get_if_addrs;
-use iced::{
-    Application, 
-    Settings, 
-    Subscription,
-    Alignment, 
-    Command as IcedCommand, 
-    Element, 
-    Length, 
-    futures::channel::mpsc::Sender, 
-    subscription, 
-    widget::{
-        button,
-        Button, 
-        text::Text, 
-        Row, 
-        Column, 
-        Space, 
-        Container
-    }
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
 };
+use sysinfo::{CpuRefreshKind, RefreshKind, System};
+
+use if_addrs::get_if_addrs;
 use iced_native::Align;
-use plotters::series;
 use pnet::packet::{
     Packet, 
     ethernet::EthernetPacket, 
@@ -46,6 +52,17 @@ use pnet::packet::{
     udp::UdpPacket
 };
 use regex::Regex;
+
+
+const PLOT_SECONDS: usize = 60; //1 min
+const TITLE_FONT_SIZE: u16 = 22;
+const SAMPLE_EVERY: Duration = Duration::from_millis(1000);
+
+const FONT_BOLD: Font = Font {
+    family: font::Family::Name("Noto Sans"),
+    weight: font::Weight::Bold,
+    ..Font::DEFAULT
+};
 
 // Define the Process struct
 #[derive(Clone, Hash, Eq, PartialEq)]
@@ -61,6 +78,7 @@ struct Packets {
     received_size: u32,
     sent_number: u32,
     received_number: u32,
+    bandwidth: u32,
 }
 impl ToString for Packets {
     fn to_string(&self) -> String {
@@ -75,38 +93,40 @@ impl Packets {
     pub fn new( sent_size: u32,
     received_size: u32,
     sent_number: u32,
-    received_number: u32) -> Self {
+    received_number: u32,
+    bandwidth: u32) -> Self {
         Self {
             sent_size,
             received_size,
             sent_number,
             received_number,
+            bandwidth,
         }
     }
 }
+
 enum Page {
     TablePage,
     GraphPage,
     ConfigPage,
 }
-// Usage
-struct App {
-    page: Page,
-    data: HashMap<Process, Packets>,
-    receiver: RefCell<Option<std::sync::mpsc::Receiver<Message>>>,
-    config_button: button::State,
-    graph_button: button::State,
-    table_button1: button::State,
-    table_button2: button::State,
-}
 
 #[derive(Clone)]
 enum Message {
+    /// message that cause charts' data lazily updated
+    Tick,
+    FontLoaded(Result<(), font::Error>),
     NewData(HashMap<Process, Packets>),
     NavigateToTablePage,
     NavigateToGraphPage,
     NavigateToConfigPage,
-    // other messages...
+}
+
+struct State {
+    chart: SystemChart,
+    page: Page,
+    data: HashMap<Process, Packets>,
+    receiver: RefCell<Option<std::sync::mpsc::Receiver<Message>>>,
 }
 
 impl fmt::Debug for Message {
@@ -118,46 +138,44 @@ impl fmt::Debug for Message {
                  .field("data", &"Non-debuggable data")
                  .finish()
             },
-            Message::NavigateToTablePage => Ok(()),
-            Message::NavigateToGraphPage => Ok(()),
-            Message::NavigateToConfigPage => Ok(()),
+            _ => Ok(()),
         }
     }
 }
 
 
-
-impl Application for App {
-    type Executor = iced::executor::Default;
-    type Message = Message;
+impl Application for State {
+    type Message = self::Message;
+    type Executor = executor::Default;
     type Flags = UiFlags;
-    type Theme= iced::Theme;
-    // fn new(flags: UiFlags) -> (Self, Command<Message>) {
-    //     let app = Ui {
-    //         receiver: RefCell::new(Some(flags.receiver)),
-    //         num: 0,
-    //     };
-    //     (app, Command::none())
-    // }
+    type Theme = Theme;
 
-    fn new(flags: UiFlags) -> (App, IcedCommand<Self::Message>) {
-        (App {
-            page: Page::TablePage, 
-            data: HashMap::new(),
-            receiver:RefCell::new(Some(flags.receiver)),
-            config_button: button::State::new(),
-            graph_button: button::State::new(),
-            table_button1: button::State::new(),
-            table_button2: button::State::new(),
-        }, IcedCommand::none())
+    fn new(_flags: Self::Flags) -> (Self, Command<Self::Message>) {
+        (
+            Self {
+                chart: Default::default(),
+                page: Page::TablePage, 
+                data: HashMap::new(),
+                receiver:RefCell::new(Some(_flags.receiver)),
+            },
+            Command::batch([
+                font::load(include_bytes!("./fonts/notosans-regular.ttf").as_slice())
+                    .map(Message::FontLoaded),
+                font::load(include_bytes!("./fonts/notosans-bold.ttf").as_slice())
+                    .map(Message::FontLoaded),
+            ]),
+        )
     }
 
     fn title(&self) -> String {
-        String::from("My Window")
+        "Process Internet Monitor".to_owned()
     }
 
-    fn update(&mut self, message: Self::Message) -> IcedCommand<Self::Message> {
+    fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
         match message {
+            Message::Tick => {
+                self.chart.update(self.data.clone());
+            }
             Message::NewData(new_data) => {
                 self.data = new_data;
                 /*for (process, packets) in new_data {
@@ -172,9 +190,9 @@ impl Application for App {
             Message::NavigateToGraphPage => {
                 self.page = Page::GraphPage;
             }
-            // handle other messages...
+            _ => {}
         }
-        IcedCommand::none()
+        Command::none()
     }
     fn view(& self) -> Element<Self::Message> {
         match self.page{
@@ -185,7 +203,8 @@ impl Application for App {
                     .push(Container::new(Text::new(format!("{: >20}","sent size"))).padding(20)) // Add padding
                     .push(Container::new(Text::new(format!("{: >20}","received size"))).padding(20)) // Add padding
                     .push(Container::new(Text::new(format!("{: >20}","sent number"))).padding(20)) // Add padding
-                    .push(Container::new(Text::new(format!("{: >20}","received number"))).padding(20)); // Add padding
+                    .push(Container::new(Text::new(format!("{: >20}","received number"))).padding(20)) // Add padding
+                    .push(Container::new(Text::new(format!("{: >20}","bandwidth"))).padding(20)); // Add padding
                 table = table.push(row);
                 for (process, packets) in &self.data {
                     let row = Row::new()
@@ -193,7 +212,8 @@ impl Application for App {
                         .push(Container::new(Text::new(format!("{: >20}",packets.sent_size))).padding(20)) // Add padding
                         .push(Container::new(Text::new(format!("{: >20}",packets.received_size))).padding(20)) // Add padding
                         .push(Container::new(Text::new(format!("{: >20}",packets.sent_number))).padding(20)) // Add padding
-                        .push(Container::new(Text::new(format!("{: >20}",packets.received_number))).padding(20)); // Add padding
+                        .push(Container::new(Text::new(format!("{: >20}",packets.received_number))).padding(20)) // Add padding
+                        .push(Container::new(Text::new(format!("{: >30}",packets.bandwidth))).padding(20)); // Add padding
                     table = table.push(iced::widget::Rule::horizontal(10)); // Add a horizontal line
                     table = table.push(row);
                 }
@@ -212,28 +232,28 @@ impl Application for App {
                 table.into()
             }
             Page::GraphPage => {
-                let mut graph_page = Column::new();
-                //let series = Series::new(self.data,plotters_iced::series::LineSeries::new());
-                graph_page = graph_page.push(Button::new("Back").on_press(Message::NavigateToTablePage));
-                // let chart = ChartBuilder::default()
-                //     .margin(5)
-                //     .caption("Example Chart", ("Arial", 50).into_font())
-                //     .x_label_area_size(30)
-                //     .y_label_area_size(30)
-                //     .build_cartesian_2d(0f32..10f32, 0f32..10f32)
-                //     .unwrap()
-                //     .configure_mesh()
-                //     .draw()
-                //     .unwrap()
-                //     .draw_series(series)
-                //     .unwrap();
-                // Add the chart to your page
-                //graph_page = graph_page.push(chart);
-                // let button = Button::new(&mut self.table_button1)
-                //     .on_press(Message::NavigateToTablePage);
-                // graph_page = graph_page.push(button);
-            
-                graph_page.into()
+                let mut content = Column::new()
+                    .spacing(20)
+                    .align_items(Alignment::Start)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .push(
+                        Text::new("Iced test chart")
+                            .size(TITLE_FONT_SIZE)
+                            .font(FONT_BOLD),
+                    )
+                    .push(self.chart.view());
+
+                content = content.push(Button::new("Back").on_press(Message::NavigateToTablePage));
+
+                Container::new(content)
+                    //.style(style::Container)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .padding(5)
+                    .center_x()
+                    .center_y()
+                    .into()
             }
             Page::ConfigPage => {
                 let mut config_page = Column::new().push(Text::new("Config page"));
@@ -245,30 +265,283 @@ impl Application for App {
                 config_page.into()
             }
         }
-        
+                
     }
+
     fn subscription(&self) -> Subscription<Message> {
-        subscription::unfold(
+        const FPS: u64 = 50;
+        let tick_subscription = iced::time::every(Duration::from_millis(1000 / FPS)).map(|_| Message::Tick);
+    
+        let led_changes_subscription = subscription::unfold(
             "led changes",
             self.receiver.take(),
             move |mut receiver| async move {
                 let process_packets = receiver.as_mut().unwrap().recv().unwrap();
                 (process_packets, receiver)
             },
-        )
+        );
+    
+        Subscription::batch(vec![tick_subscription, led_changes_subscription])
     }
 }
 struct UiFlags {
     receiver:std::sync::mpsc::Receiver<Message>,
 }
-#[tokio::main] // Change this
-async fn main() {
-    // Spawn the GUI task
 
-    let (sender, receiver) = std::sync::mpsc::channel();
+struct SystemChart {
+    sys: System,
+    last_sample_time: Instant,
+    items_per_row: usize,
+    processors: Vec<CpuUsageChart>,
+    chart_height: f32,
+}
+
+impl Default for SystemChart {
+    fn default() -> Self {
+        Self {
+            sys: System::new_with_specifics(
+                RefreshKind::new().with_cpu(CpuRefreshKind::new().with_cpu_usage()),
+            ),
+            last_sample_time: Instant::now(),
+            items_per_row: 3,
+            processors: Default::default(),
+            chart_height: 300.0,
+        }
+    }
+}
+
+impl SystemChart {
+    #[inline]
+    fn is_initialized(&self) -> bool {
+        !self.processors.is_empty()
+    }
+
+    #[inline]
+    fn should_update(&self) -> bool {
+        !self.is_initialized() || self.last_sample_time.elapsed() > SAMPLE_EVERY
+    }
+
+    fn update(&mut self, data1: HashMap<Process, Packets>) {
+        if !self.should_update() {
+            return;
+        }
+    
+        self.sys.refresh_cpu();
+        self.last_sample_time = Instant::now();
+        let now = Utc::now();
+    
+        //check if initialized
+        if !self.is_initialized() {
+            let mut processors: Vec<_> = data1
+                .into_iter()
+                .map(|(process, packets)| CpuUsageChart::new(vec![(now, packets.bandwidth as i32)].into_iter(), process.name))
+                .collect();
+            self.processors.append(&mut processors);
+        } else {
+            // Find new processes
+            let new_processes: HashMap<_, _> = data1
+                .clone()
+                .into_iter()
+                .filter(|(process, _)| !self.processors.iter().any(|p| p.name == process.name))
+                .collect();
+    
+            // Append new processes to processors
+            let mut new_processors: Vec<_> = new_processes
+                .into_iter()
+                .map(|(process, packets)| CpuUsageChart::new(vec![(now, packets.bandwidth as i32)].into_iter(), process.name))
+                .collect();
+            self.processors.append(&mut new_processors);
+    
+            // Update existing processors
+            for ((process, packets), p) in data1.into_iter().zip(self.processors.iter_mut()) {
+                if process.name == p.name {
+                    p.push_data(now, packets.bandwidth as i32);
+                }
+            }
+        }
+    }
+
+    fn view(&self) -> Element<Message> {
+        if !self.is_initialized() {
+            Text::new("Loading...")
+                .horizontal_alignment(Horizontal::Center)
+                .vertical_alignment(Vertical::Center)
+                .into()
+        } else {
+            let mut col = Column::new()
+                .width(Length::Fill)
+                .height(Length::Shrink)
+                .align_items(Alignment::Center);
+
+            let chart_height = self.chart_height;
+            let mut idx = 0;
+            for chunk in self.processors.chunks(self.items_per_row) {
+                let mut row = Row::new()
+                    .spacing(15)
+                    .padding(20)
+                    .width(Length::Fill)
+                    .height(Length::Shrink)
+                    .align_items(Alignment::Center);
+                for item in chunk {
+                    row = row.push(item.view(idx, chart_height));
+                    idx += 1;
+                }
+                while idx % self.items_per_row != 0 {
+                    row = row.push(Space::new(Length::Fill, Length::Fixed(50.0)));
+                    idx += 1;
+                }
+                col = col.push(row);
+            }
+
+            Scrollable::new(col).height(Length::Shrink).into()
+        }
+    }
+}
+
+struct CpuUsageChart {
+    cache: Cache,
+    data_points: VecDeque<(DateTime<Utc>, i32)>,
+    limit: Duration,
+    name: String,
+}
+
+impl CpuUsageChart {
+    fn new(data: impl Iterator<Item = (DateTime<Utc>, i32)>, n: String) -> Self {
+        let data_points: VecDeque<_> = data.collect();
+        Self {
+            cache: Cache::new(),
+            data_points,
+            limit: Duration::from_secs(PLOT_SECONDS as u64),
+            name: n,
+        }
+    }
+
+    fn push_data(&mut self, time: DateTime<Utc>, value: i32) {
+        let cur_ms = time.timestamp_millis();
+        self.data_points.push_front((time, value));
+        loop {
+            if let Some((time, _)) = self.data_points.back() {
+                let diff = Duration::from_millis((cur_ms - time.timestamp_millis()) as u64);
+                if diff > self.limit {
+                    self.data_points.pop_back();
+                    continue;
+                }
+            }
+            break;
+        }
+        self.cache.clear();
+    }
+
+    fn view(&self, idx: usize, chart_height: f32) -> Element<Message> {
+        Column::new()
+            .width(Length::Fill)
+            .height(Length::Shrink)
+            .spacing(5)
+            .align_items(Alignment::Center)
+            .push(Text::new(format!("{}", self.name)))
+            .push(ChartWidget::new(self).height(Length::Fixed(chart_height)))
+            .into()
+    }
+}
+
+impl Chart<Message> for CpuUsageChart {
+    type State = ();
+    // fn update(
+    //     &mut self,
+    //     event: Event,
+    //     bounds: Rectangle,
+    //     cursor: Cursor,
+    // ) -> (event::Status, Option<Message>) {
+    //     self.cache.clear();
+    //     (event::Status::Ignored, None)
+    // }
+
+    #[inline]
+    fn draw<R: Renderer, F: Fn(&mut Frame)>(
+        &self,
+        renderer: &R,
+        bounds: Size,
+        draw_fn: F,
+    ) -> Geometry {
+        renderer.draw_cache(&self.cache, bounds, draw_fn)
+    }
+
+    fn build_chart<DB: DrawingBackend>(&self, _state: &Self::State, mut chart: ChartBuilder<DB>) {
+        use plotters::prelude::*;
+
+        const PLOT_LINE_COLOR: RGBColor = RGBColor(0, 175, 255);
+
+        // Acquire time range
+        let newest_time = self
+            .data_points
+            .front()
+            .unwrap_or(&(
+                Utc.from_utc_datetime(&chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
+                0,
+            ))
+            .0;
+        let oldest_time = newest_time - chrono::Duration::seconds(PLOT_SECONDS as i64);
+        // Find the maximum value in data_points
+        let mut max_value = self.data_points.iter().map(|(_, value)| value).max().unwrap_or(&0);
+        if *max_value == 0 {
+            max_value = &100;
+        }
+        let mut chart = chart
+            .x_label_area_size(0)
+            .y_label_area_size(28)
+            .margin(50)
+            .build_cartesian_2d(oldest_time..newest_time, 0..*max_value)
+            .expect("failed to build chart");
+
+        chart
+            .configure_mesh()
+            .bold_line_style(plotters::style::colors::BLUE.mix(0.1))
+            .light_line_style(plotters::style::colors::BLUE.mix(0.05))
+            .axis_style(ShapeStyle::from(plotters::style::colors::BLUE.mix(0.45)).stroke_width(1))
+            .y_labels(10)
+            .y_label_style(
+                ("sans-serif", 15)
+                    .into_font()
+                    .color(&plotters::style::colors::BLUE.mix(0.65))
+                    .transform(FontTransform::Rotate90),
+            )
+            .y_label_formatter(&|y| format!("{}", y))
+            .draw()
+            .expect("failed to draw chart mesh");
+
+        chart
+            .draw_series(
+                AreaSeries::new(
+                    self.data_points.iter().map(|x| (x.0, x.1)),
+                    0,
+                    PLOT_LINE_COLOR.mix(0.175),
+                )
+                .border_style(ShapeStyle::from(PLOT_LINE_COLOR).stroke_width(2)),
+            )
+            .expect("failed to draw chart data");
+    }
+}
+
+
+
+
+
+
+
+
+fn main() {
+    let mut runtime = tokio::runtime::Runtime::new().unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    let rc = Arc::clone(&running);
+
+    // Move the creation of the runtime and the async block into a separate function
+    fn run_async(running: Arc<AtomicBool>) {
+        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+
+        runtime.block_on(async {
+            let (sender, receiver) = std::sync::mpsc::channel();
 
     let network_task = tokio::spawn(async move{
-    
 
     
     // Choose the network interface for capturing. E.g., "eth0"
@@ -286,26 +559,33 @@ async fn main() {
 
     let ss_output_map: Arc<Mutex<HashMap<String, Process>>> = Arc::new(Mutex::new(HashMap::new()));
     let ss_map_for_thread = Arc::clone(&ss_output_map);
+    let running_clone = Arc::clone(&running);
     thread::spawn(move || {
-        loop {
+        while running_clone.load(Ordering::SeqCst) {
             // Run the ss command
             SSUpdate(&ss_map_for_thread, ip);
 
             // Sleep for a while before the next update
-            //thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(10));
+            println!("SSUpdate");
         }
     });
 
     // In your main function, clone the Arc before moving it into the thread
     let map_for_thread = Arc::clone(&process_packet_map);
     let global_map_for_thread = Arc::clone(&global_process_packet_map);
+    let running_clone2 = Arc::clone(&running);
     // Spawn a new thread for printing the live outputs
     thread::spawn(move || {
-        loop {
+        while running_clone2.load(Ordering::SeqCst){
             Monitor(&map_for_thread, &global_map_for_thread);
             let new_data = global_map_for_thread.lock().unwrap().clone();
-            sender.send(Message::NewData(new_data)).unwrap();
+            match sender.send(Message::NewData(new_data)) {
+                Ok(_) => {},
+                Err(e) => {return},
+            };
             thread::sleep(Duration::from_secs(1));
+            println!("Monitor");
         }
     });
 
@@ -315,8 +595,13 @@ async fn main() {
         .snaplen(5000)  // Set the maximum bytes to capture per packet
         .open().unwrap();
 
+    let running_clone3 = Arc::clone(&running);
     // Start capturing packets
     while let Ok(packet) = cap.next() {
+        println!("Packet captured");
+        if !running_clone3.load(Ordering::SeqCst){
+            return;
+        }
         let packet_data = packet.data.to_vec();
         let ethernet = EthernetPacket::owned(packet_data).unwrap();
         let len = packet.data.len() as u32;
@@ -329,12 +614,22 @@ async fn main() {
         });
 
     }
-    });
-    App::run(Settings::with_flags(UiFlags { receiver }));
-    let _ = tokio::try_join!(network_task);
 
-      
+    });
+        State::run(Settings {
+            antialiasing: true,
+            default_font: Font::with_name("Noto Sans"),
+            ..Settings::with_flags(UiFlags { receiver })
+        })
+        .unwrap();
+    });
+
+        // The runtime is dropped here, which is outside of the async block
     }
+    run_async(running);
+    println!("App::run");
+    rc.store(false, Ordering::SeqCst);
+}
 
 
 
@@ -347,31 +642,37 @@ fn Monitor(process_packet_map: &Arc<Mutex<HashMap<Process, Packets>>>, global_pr
     // Print the process packet map
     for (process, packet) in &*map {
         let pack = global_map.entry(process.clone())
-            .or_insert(Packets { sent_size: 0, received_size: 0, sent_number: 0, received_number: 0 });
+            .or_insert(Packets { sent_size: 0, received_size: 0, sent_number: 0, received_number: 0, bandwidth: 0});
         pack.sent_size += packet.sent_size;
         pack.received_size += packet.received_size;
         pack.sent_number += packet.sent_number;
-        pack.received_number += packet.received_number;                                
+        pack.received_number += packet.received_number; 
+        pack.bandwidth = packet.sent_size + packet.received_size;                            
     }
     }
     {
     let map = process_packet_map.lock().unwrap();
-    let global_map = global_process_packet_map.lock().unwrap();
+    {
+    let mut global_map = global_process_packet_map.lock().unwrap();
 
-    for (process, pack) in &*global_map {
+    for (process, pack) in &mut *global_map {
         if let Some(packet) = map.get(&process) {
             println!("Process: {} ({})", process.name, process.id);
             println!("Sending Rate: {} packets per second, {} bits per second", packet.sent_number, packet.sent_size);
             println!("Receiving Rate: {} packets per second, {} bits per second", packet.received_number, packet.received_size);
             println!("Total Sent: {} packets, {} bits", pack.sent_number, pack.sent_size);
             println!("Total Received: {} packets, {} bits", pack.received_number, pack.received_size);
+            println!("Bandwidth: {} bits per second", pack.bandwidth);
         } else {
             println!("Process: {} ({})", process.name, process.id);
             println!("Sending Rate: {} packets per second, {} bits per second", 0, 0);
             println!("Receiving Rate: {} packets per second, {} bits per second", 0, 0);
             println!("Total Sent: {} packets, {} bits", pack.sent_number, pack.sent_size);
             println!("Total Received: {} packets, {} bits", pack.received_number, pack.received_size);
+            pack.bandwidth = 0; 
+            println!("Bandwidth: {} bits per second", pack.bandwidth);
         }
+    }
     }
     }
     print!("--------------------------------------------------------------------------------------------------------------------\n");
@@ -395,13 +696,15 @@ fn Capture(process_packet_map: &Arc<Mutex<HashMap<Process, Packets>>>, ethernet:
                         port = tcp.get_destination();
                     }
 
+                    for i in 0..10 {
+                        {
                     // Get the process name and info from the ports map
                     let ports_map = ports.lock().unwrap();
                     match ports_map.get(&port.to_string()) {
                         Some(process) => {
                             let mut map = process_packet_map.lock().unwrap();
                             let pack = map.entry(process.clone())
-                                .or_insert(Packets { sent_size: 0, received_size: 0, sent_number: 0, received_number: 0 });
+                                .or_insert(Packets { sent_size: 0, received_size: 0, sent_number: 0, received_number: 0 , bandwidth: 0});
                             if address == ip {
                                 pack.sent_size += (packet_length * 8) as u32;
                                 pack.sent_number += 1;
@@ -409,8 +712,12 @@ fn Capture(process_packet_map: &Arc<Mutex<HashMap<Process, Packets>>>, ethernet:
                                 pack.received_size += (packet_length * 8) as u32;
                                 pack.received_number += 1;
                             }
+                            break;
                         },
-                        None => println!("Error: No process found for port {}", port),
+                        None => {if i == 9 {println!("Error: No process found for port {}", port)}}
+                    }
+                        }
+                    thread::sleep(Duration::from_millis(100));
                     }
                 }
             },
@@ -422,22 +729,28 @@ fn Capture(process_packet_map: &Arc<Mutex<HashMap<Process, Packets>>>, ethernet:
                         port = udp.get_destination();
                     }
 
-                    // Get the process name and info from the ports map
-                    let ports_map = ports.lock().unwrap();
-                    match ports_map.get(&port.to_string()) {
-                        Some(process) => {
-                            let mut map = process_packet_map.lock().unwrap();
-                            let pack = map.entry(process.clone())
-                                .or_insert(Packets { sent_size: 0, received_size: 0, sent_number: 0, received_number: 0 });
-                            if address == ip {
-                                pack.sent_size += (packet_length * 8) as u32;
-                                pack.sent_number += 1;
-                            } else {
-                                pack.received_size += (packet_length * 8) as u32;
-                                pack.received_number += 1;
-                            }
-                        },
-                        None => println!("Error: No process found for port {}", port),
+                    for i in 0..10 {
+                        // Get the process name and info from the ports map
+                        {
+                        let ports_map = ports.lock().unwrap();
+                        match ports_map.get(&port.to_string()) {
+                            Some(process) => {
+                                let mut map = process_packet_map.lock().unwrap();
+                                let pack = map.entry(process.clone())
+                                    .or_insert(Packets { sent_size: 0, received_size: 0, sent_number: 0, received_number: 0, bandwidth: 0});
+                                if address == ip {
+                                    pack.sent_size += (packet_length * 8) as u32;
+                                    pack.sent_number += 1;
+                                } else {
+                                    pack.received_size += (packet_length * 8) as u32;
+                                    pack.received_number += 1;
+                                }
+                                break;
+                            },
+                            None => {if i == 9 {println!("Error: No process found for port {}", port)}}
+                        }
+                        }
+                        thread::sleep(Duration::from_millis(100));
                     }
                 }
             },
@@ -450,7 +763,7 @@ fn Capture(process_packet_map: &Arc<Mutex<HashMap<Process, Packets>>>, ethernet:
 
 
 fn SSUpdate(ss_map_for_thread: &Arc<Mutex<HashMap<String, Process>>>, ip: IpAddr){
-    let ss_out = Command::new("ss")
+    let ss_out = PrcCommand::new("ss")
         .arg("-p")
         .arg("-n")
         .arg("-t")
@@ -462,7 +775,7 @@ fn SSUpdate(ss_map_for_thread: &Arc<Mutex<HashMap<String, Process>>>, ip: IpAddr
     //print!("{}", ss_output);
 
     // Call ps command and create a map from pid to process name
-    let ps_out = Command::new("ps")
+    let ps_out = PrcCommand::new("ps")
         .arg("-e")
         .arg("-o")
         .arg("pid,comm")
