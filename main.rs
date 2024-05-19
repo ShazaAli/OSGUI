@@ -23,6 +23,14 @@ use iced::{
     futures::channel::mpsc::Sender, 
 
 };
+use iced::widget::TextInput;
+lazy_static::lazy_static! {
+    static ref MAX_TOTAL_SENT: tokio::sync::RwLock<u32> = tokio::sync::RwLock::new(0);
+    static ref MAX_TOTAL_RECEIVED: tokio::sync::RwLock<u32> = tokio::sync::RwLock::new(0);
+    static ref LOGGING_FREQUENCY: tokio::sync::RwLock<u32> = tokio::sync::RwLock::new(0);
+}
+
+
 use plotters::prelude::ChartBuilder;
 use plotters_backend::DrawingBackend;
 use plotters_iced::{Chart, ChartWidget, Renderer};
@@ -120,6 +128,10 @@ enum Message {
     NavigateToTablePage,
     NavigateToGraphPage,
     NavigateToConfigPage,
+    MaxTotalSentChanged(String),
+    MaxTotalReceivedChanged(String),
+    LoggingFrequencyChanged(String),
+    EnterPressed,
 }
 
 struct State {
@@ -127,6 +139,13 @@ struct State {
     page: Page,
     data: HashMap<Process, Packets>,
     receiver: RefCell<Option<std::sync::mpsc::Receiver<Message>>>,
+    max_total_sent_state: TextInput::State,
+    max_total_sent: String,
+    max_total_received_state: TextInput::State,
+    max_total_received: String,
+    logging_frequency_state: TextInput::State,
+    logging_frequency: String,
+    enter_button_state: button::State,
 }
 
 impl fmt::Debug for Message {
@@ -190,9 +209,27 @@ impl Application for State {
             Message::NavigateToGraphPage => {
                 self.page = Page::GraphPage;
             }
-            _ => {}
+            Message::MaxTotalSentChanged(value) => self.max_total_sent = value,
+            Message::MaxTotalReceivedChanged(value) => self.max_total_received = value,
+            Message::LoggingFrequencyChanged(value) => self.logging_frequency = value,
+            Message::EnterPressed => {
+                // Update the global variables
+                let max_total_sent = self.max_total_sent.parse().unwrap_or(0);
+                let max_total_received = self.max_total_received.parse().unwrap_or(0);
+                let logging_frequency = self.logging_frequency.parse().unwrap_or(0);
+
+                let mut max_total_sent_lock = MAX_TOTAL_SENT.write().await;
+                                *max_total_sent_lock = max_total_sent;
+
+                let mut max_total_received_lock = MAX_TOTAL_RECEIVED.write().await;
+                *max_total_received_lock = max_total_received;
+
+                let mut logging_frequency_lock = LOGGING_FREQUENCY.write().await;
+                *logging_frequency_lock = logging_frequency;
+         
         }
         Command::none()
+    }
     }
     fn view(& self) -> Element<Self::Message> {
         match self.page{
@@ -256,13 +293,36 @@ impl Application for State {
                     .into()
             }
             Page::ConfigPage => {
-                let mut config_page = Column::new().push(Text::new("Config page"));
-                config_page = config_page.push(Button::new("Back").on_press(Message::NavigateToTablePage));
-                // let button = Button::new(&mut self.table_button1)
-                //     .on_press(Message::NavigateToTablePage);
-                // config_page = config_page.push(button);
-            
-                config_page.into()
+                Column::new()
+                .push(
+                    TextInput::new(
+                        &mut self.max_total_sent_state,
+                        "Max total sent data",
+                        &self.max_total_sent,
+                        Message::MaxTotalSentChanged,
+                    ),
+                )
+                .push(
+                    TextInput::new(
+                        &mut self.max_total_received_state,
+                        "Max total received data",
+                        &self.max_total_received,
+                        Message::MaxTotalReceivedChanged,
+                    ),
+                )
+                .push(
+                    TextInput::new(
+                        &mut self.logging_frequency_state,
+                        "Logging frequency time in seconds",
+                        &self.logging_frequency,
+                        Message::LoggingFrequencyChanged,
+                    ),
+                )
+                .push(
+                    Button::new(&mut self.enter_button_state, Text::new("Enter"))
+                        .on_press(Message::EnterPressed),
+                )
+                .into()
             }
         }
                 
@@ -309,6 +369,7 @@ impl Default for SystemChart {
         }
     }
 }
+
 
 impl SystemChart {
     #[inline]

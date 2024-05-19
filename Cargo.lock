@@ -1833,6 +1833,7 @@ dependencies = [
  "iced",
  "iced_native",
  "if-addrs",
+ "lazy_static",
  "once_cell",
  "pcap",
  "plotters",

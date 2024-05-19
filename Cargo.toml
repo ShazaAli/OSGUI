@@ -9,6 +9,7 @@ name = "my_project"
 path = "main.rs"
 
 [dependencies]
+lazy_static = "1.4.0"
 once_cell = "1.8.0"
 plotters-bitmap = "0.3"
 iced_native = "0.3"
